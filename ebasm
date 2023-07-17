@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+import sys
+
+label_re = r'(\.[A-Za-z_]\w*)'
+label_line_re = r'^\s*%s:' % label_re
+
+
+def unsigned(n):
+    """Converts int "n" to an unsigned hex representation."""
+
+    assert n >= -128 and n <= 127
+    s = bin(-n)[2:]
+    s = ('0' * (8 - len(s))) + s
+    return '%02x' % (
+        n if n >= 0 else int(s.replace('0', 'x')
+                              .replace('1', '0')
+                              .replace('x', '1'), base=2) + 1)
+
+def rom_loc(asm, out, loc):
+    """Outputs the start of a code block at a given ROM address."""
+
+    if asm.func_open:
+        out.extend(('}', ''))
+    asm.func_open = True
+    out.append('ROM[%s] = {' % loc)
+
+def subr(asm, out, name):
+    """Outputs the start of a code block for a new subroutine."""
+
+    if asm.func_open:
+        out.extend(('}', ''))
+    asm.func_open = True
+    out.append('%s: {' % name)
+
+def comment_fn(asm, out, whitespace, comment):
+    """Outputs a comment in CCS given the comment and preceding whitespace."""
+
+    if asm.output_comments:
+        out.append('%s//%s' % (whitespace, comment))
+
+def jsl_fn(asm, out, name):
+    """Outputs a call to JSL with the given subroutine name."""
+
+    out.append('    JSL(%s)' % name)
+
+def inst(op, size):
+    """Returns a function that outputs an instruction with opcode "op" which is
+       "size" bytes long."""
+
+    return lambda asm, out, arg='': (
+        out.append(('    "[%s' + ' %s' * (size - 1) + ']"') %
+                   (op, *(arg[i:i + 2].lower()
+                          for i in range(len(arg) - 2, -1, -2)))))
+
+def _bra_label(asm, out, op, label):
+    off = asm.labels[label] - asm.byte_idx
+    if off < -128 or off > 127:
+        print('Offset to label "%s" too large.' % label, file=sys.stderr)
+        sys.exit(1)
+
+    n = unsigned(off)
+    inst(op, 2)(asm, out, n)
+
+def bra_label(op):
+    """Returns a function that takes a label and outputs a branch instruction
+       with opcode "op" and offset to the label."""
+
+    return lambda asm, out, label: _bra_label(asm, out, op, label)
+
+def blank(asm, out, *args):
+    if asm.output_comments:
+        out.append('')
+
+def optional_blank(asm, out, *args):
+    if asm.output_comments and out[-1] != '':
+        out.append('')
+
+def re_inst(op, size, prefix='', suffix=''):
+    """Returns a regular expression that matches operation name "op", a given
+       number of bytes, and optionally a prefix ("#", for literals) or suffix
+       (",X" or ",Y")."""
+
+    return r'%s\s+%s\$([A-Fa-f0-9]{%d})%s' % (
+           op, prefix, 2 * (size - 1), suffix)
+
+def re_inst_imm(op, size):
+    return re_inst(op, size, prefix='#')
+
+def re_inst_x(op, size):
+    return re_inst(op, size, suffix=',X')
+
+def re_inst_y(op, size):
+    return re_inst(op, size, suffix=',Y')
+
+def re_bra(op):
+     """Returns a regular expression that matches a branch to a label."""
+
+     return r'%s\s+%s' % (op, label_re)
+
+rules = (
+    (r'^\s*ROM\[(0x[A-Fa-f0-9]{6})\]:', rom_loc, 0),
+               (r'^\s*([A-Za-z_]\w*):', subr, 0),
+
+              (label_line_re, blank, 0),
+             (r'^(\s*);(.*)', comment_fn, 0),
+                   (r'^\s*$', optional_blank, 0),
+
+    (r'JSL\s+([A-Za-z_]\w*)', jsl_fn, 4),
+              (re_bra('BRA'), bra_label('80'), 2),
+              (re_bra('BEQ'), bra_label('f0'), 2),
+              (re_bra('BNE'), bra_label('d0'), 2),
+              (re_bra('BLT'), bra_label('90'), 2),
+              (re_bra('BGE'), bra_label('b0'), 2),
+
+      (re_inst_imm('BEQ', 2), inst('f0', 2), 2),
+          (re_inst('JMP', 3), inst('4c', 3), 3),
+          (re_inst('JSL', 4), inst('22', 4), 4),
+
+        (re_inst_x('LDA', 2), inst('b5', 2), 2),
+        (re_inst_x('LDA', 3), inst('bd', 3), 3),
+        (re_inst_y('LDA', 3), inst('b9', 3), 3),
+      (re_inst_imm('LDA', 3), inst('a9', 3), 2),
+          (re_inst('LDA', 3), inst('ad', 3), 3),
+          (re_inst('LDA', 2), inst('a5', 2), 2),
+      (re_inst_imm('LDX', 3), inst('a2', 3), 3),
+          (re_inst('LDX', 2), inst('a6', 2), 2),
+      (re_inst_imm('LDY', 3), inst('a0', 3), 3),
+          (re_inst('LDY', 2), inst('a4', 2), 2),
+        (re_inst_x('STA', 3), inst('9d', 3), 2),
+        (re_inst_x('STA', 2), inst('95', 2), 2),
+        (re_inst_y('STA', 3), inst('99', 3), 3),
+          (re_inst('STA', 2), inst('85', 2), 2),
+          (re_inst('STX', 2), inst('86', 2), 2),
+          (re_inst('STY', 2), inst('84', 2), 2),
+        (re_inst_x('STZ', 3), inst('9e', 3), 3),
+          (re_inst('STZ', 2), inst('64', 2), 2),
+
+          (re_inst('INC', 2), inst('e6', 2), 2),
+        (re_inst_y('ADC', 3), inst('79', 3), 3),
+      (re_inst_imm('ADC', 3), inst('69', 3), 3),
+          (re_inst('ADC', 2), inst('65', 2), 2),
+      (re_inst_imm('SBC', 3), inst('e9', 3), 3),
+          (re_inst('SBC', 2), inst('e5', 2), 2),
+      (re_inst_imm('AND', 3), inst('29', 3), 3),
+      (re_inst_imm('CMP', 3), inst('c9', 3), 3),
+          (re_inst('CMP', 2), inst('c5', 2), 2),
+      (re_inst_imm('REP', 2), inst('c2', 2), 2),
+
+                     (r'NOP', inst('ea', 1), 1),
+                     (r'SEC', inst('38', 1), 1),
+                     (r'CLC', inst('18', 1), 1),
+                     (r'ASL', inst('0a', 1), 1),
+                     (r'TCD', inst('5b', 1), 1),
+                     (r'TDC', inst('7b', 1), 1),
+                     (r'TAX', inst('aa', 1), 1),
+                     (r'TAY', inst('a8', 1), 1),
+                     (r'TYA', inst('98', 1), 1),
+                     (r'PHD', inst('0b', 1), 1),
+                     (r'PLD', inst('2b', 1), 1),
+                     (r'RTL', inst('6b', 1), 1),
+)
+
+
+class Assembler:
+    def __init__(self, output_comments):
+        self.output_comments = output_comments
+        self.func_open = False
+        self.labels = {}
+
+    def assemble(self, in_text):
+        """Returns CCS for given 65C816 assembly."""
+
+        # Always output the JSL macro, for newly-defined subroutines.
+        out_lines = [
+            'command adr24(a) "[{byte[0] a} {byte[1] a} {byte[2] a}]"',
+            'command JSL(a)   "[22 {adr24(a)}]"',
+            '',
+        ]
+
+        # Track label positions.
+        self.byte_idx = 0
+        in_lines = in_text.splitlines()
+        for i, line in enumerate(in_lines):
+            match = re.search(label_line_re, line)
+            if match:
+                self.labels[match.group(1)] = self.byte_idx
+                continue
+            for pattern, _, byte_count in rules:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    self.byte_idx += byte_count
+                    break
+            else:
+                print('Invalid syntax on line %d:\n%s' % (i + 1, line),
+                      file=sys.stderr)
+                sys.exit(1)
+
+        # Generate code.
+        self.byte_idx = 0
+        for line in in_lines:
+            for pattern, fn, byte_count in rules:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    self.byte_idx += byte_count
+                    fn(self, out_lines, *match.groups())
+                    added_line = out_lines[-1]
+                    if (self.output_comments and
+                        not re.match(r'\s*$', line) and
+                        not re.match(r'\s*;', line) and
+                        (not added_line or
+                         (added_line[-1] != '{' and added_line[-1] != ')'))):
+                        out_lines[-1] += (
+                            (' ' * (21 - len(added_line))) + '// ' + line)
+                    break
+            else:
+                assert False
+
+        if self.func_open:
+            out_lines.append('}')
+
+        return '\n'.join(out_lines)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('filename')
+    parser.add_argument('-o', '--outfile')
+    parser.add_argument(
+        '--output-comments', action=argparse.BooleanOptionalAction)
+    args = parser.parse_args()
+
+    with open(args.filename) as in_file:
+        in_text = in_file.read()
+
+    asm = Assembler(args.output_comments)
+    out_text = asm.assemble(in_text)
+    if args.outfile:
+        with open(args.outfile, 'w') as out_file:
+            out_file.write(out_text)
+    else:
+        print(out_text)
+
+
+if __name__ == '__main__':
+    main()
