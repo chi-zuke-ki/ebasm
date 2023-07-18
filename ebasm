@@ -35,7 +35,20 @@ def subr(asm, out, name):
     asm.func_open = True
     out.append('%s: {' % name)
 
-def comment_fn(asm, out, whitespace, comment):
+def blank(asm, out, *args):
+    """Outputs a blank line, if output_comments is set."""
+
+    if asm.output_comments:
+        out.append('')
+
+def optional_blank(asm, out, *args):
+    """Outputs a blank line unless the last line is already blank, if
+       output_comments is set."""
+
+    if asm.output_comments and out[-1] != '':
+        out.append('')
+
+def comment(asm, out, whitespace, comment):
     """Outputs a comment in CCS given the comment and preceding whitespace."""
 
     if asm.output_comments:
@@ -55,6 +68,12 @@ def inst(op, size):
                    (op, *(arg[i:i + 2].lower()
                           for i in range(len(arg) - 2, -1, -2)))))
 
+def bra_label(op):
+    """Returns a function that takes a label and outputs a branch instruction
+       with opcode "op" and offset to the label."""
+
+    return lambda asm, out, label: _bra_label(asm, out, op, label)
+
 def _bra_label(asm, out, op, label):
     off = asm.labels[label] - asm.byte_idx
     if off < -128 or off > 127:
@@ -64,20 +83,6 @@ def _bra_label(asm, out, op, label):
     n = unsigned(off)
     inst(op, 2)(asm, out, n)
 
-def bra_label(op):
-    """Returns a function that takes a label and outputs a branch instruction
-       with opcode "op" and offset to the label."""
-
-    return lambda asm, out, label: _bra_label(asm, out, op, label)
-
-def blank(asm, out, *args):
-    if asm.output_comments:
-        out.append('')
-
-def optional_blank(asm, out, *args):
-    if asm.output_comments and out[-1] != '':
-        out.append('')
-
 def re_inst(op, size, prefix='', suffix=''):
     """Returns a regular expression that matches operation name "op", a given
        number of bytes, and optionally a prefix ("#", for literals) or suffix
@@ -86,81 +91,90 @@ def re_inst(op, size, prefix='', suffix=''):
     return r'%s\s+%s\$([A-Fa-f0-9]{%d})%s' % (
            op, prefix, 2 * (size - 1), suffix)
 
-def re_inst_imm(op, size):
-    return re_inst(op, size, prefix='#')
-
-def re_inst_x(op, size):
-    return re_inst(op, size, suffix=',X')
-
-def re_inst_y(op, size):
-    return re_inst(op, size, suffix=',Y')
-
 def re_bra(op):
      """Returns a regular expression that matches a branch to a label."""
 
      return r'%s\s+%s' % (op, label_re)
+
+def rule(name, code, size):
+    return re_inst(name, size), inst(code, size), size
+
+def rule_imm(name, code, size):
+    return re_inst(name, size, prefix='#'), inst(code, size), size
+
+def rule_x(name, code, size):
+    return re_inst(name, size, suffix=',X'), inst(code, size), size
+
+def rule_y(name, code, size):
+    return re_inst(name, size, suffix=',Y'), inst(code, size), size
+
+def rule_byte(name, code):
+    return name, inst(code, 1), 1
+
+def rule_bra(name, code):
+    return re_bra(name), bra_label(code), 2
 
 rules = (
     (r'^\s*ROM\[(0x[A-Fa-f0-9]{6})\]:', rom_loc, 0),
                (r'^\s*([A-Za-z_]\w*):', subr, 0),
 
               (label_line_re, blank, 0),
-             (r'^(\s*);(.*)', comment_fn, 0),
+             (r'^(\s*);(.*)', comment, 0),
                    (r'^\s*$', optional_blank, 0),
 
     (r'JSL\s+([A-Za-z_]\w*)', jsl_fn, 4),
-              (re_bra('BRA'), bra_label('80'), 2),
-              (re_bra('BEQ'), bra_label('f0'), 2),
-              (re_bra('BNE'), bra_label('d0'), 2),
-              (re_bra('BLT'), bra_label('90'), 2),
-              (re_bra('BGE'), bra_label('b0'), 2),
+                  rule('JMP', '4c', 3),
+                  rule('JSL', '22', 4),
 
-      (re_inst_imm('BEQ', 2), inst('f0', 2), 2),
-          (re_inst('JMP', 3), inst('4c', 3), 3),
-          (re_inst('JSL', 4), inst('22', 4), 4),
+              rule_bra('BRA', '80'),
+              rule_bra('BEQ', 'f0'),
+              rule_bra('BNE', 'd0'),
+              rule_bra('BLT', '90'),
+              rule_bra('BGE', 'b0'),
+              rule_imm('BEQ', 'f0', 2),
 
-        (re_inst_x('LDA', 2), inst('b5', 2), 2),
-        (re_inst_x('LDA', 3), inst('bd', 3), 3),
-        (re_inst_y('LDA', 3), inst('b9', 3), 3),
-      (re_inst_imm('LDA', 3), inst('a9', 3), 2),
-          (re_inst('LDA', 3), inst('ad', 3), 3),
-          (re_inst('LDA', 2), inst('a5', 2), 2),
-      (re_inst_imm('LDX', 3), inst('a2', 3), 3),
-          (re_inst('LDX', 2), inst('a6', 2), 2),
-      (re_inst_imm('LDY', 3), inst('a0', 3), 3),
-          (re_inst('LDY', 2), inst('a4', 2), 2),
-        (re_inst_x('STA', 3), inst('9d', 3), 2),
-        (re_inst_x('STA', 2), inst('95', 2), 2),
-        (re_inst_y('STA', 3), inst('99', 3), 3),
-          (re_inst('STA', 2), inst('85', 2), 2),
-          (re_inst('STX', 2), inst('86', 2), 2),
-          (re_inst('STY', 2), inst('84', 2), 2),
-        (re_inst_x('STZ', 3), inst('9e', 3), 3),
-          (re_inst('STZ', 2), inst('64', 2), 2),
+                rule_x('LDA', 'bd', 3),
+                rule_x('LDA', 'b5', 2),
+                rule_y('LDA', 'b9', 3),
+              rule_imm('LDA', 'a9', 3),
+                  rule('LDA', 'ad', 3),
+                  rule('LDA', 'a5', 2),
+              rule_imm('LDX', 'a2', 3),
+                  rule('LDX', 'a6', 2),
+              rule_imm('LDY', 'a0', 3),
+                  rule('LDY', 'a4', 2),
+                rule_x('STA', '9d', 3),
+                rule_x('STA', '95', 2),
+                rule_y('STA', '99', 3),
+                  rule('STA', '85', 2),
+                  rule('STX', '86', 2),
+                  rule('STY', '84', 2),
+                rule_x('STZ', '9e', 3),
+                  rule('STZ', '64', 2),
 
-          (re_inst('INC', 2), inst('e6', 2), 2),
-        (re_inst_y('ADC', 3), inst('79', 3), 3),
-      (re_inst_imm('ADC', 3), inst('69', 3), 3),
-          (re_inst('ADC', 2), inst('65', 2), 2),
-      (re_inst_imm('SBC', 3), inst('e9', 3), 3),
-          (re_inst('SBC', 2), inst('e5', 2), 2),
-      (re_inst_imm('AND', 3), inst('29', 3), 3),
-      (re_inst_imm('CMP', 3), inst('c9', 3), 3),
-          (re_inst('CMP', 2), inst('c5', 2), 2),
-      (re_inst_imm('REP', 2), inst('c2', 2), 2),
+                  rule('INC', 'e6', 2),
+                rule_y('ADC', '79', 3),
+              rule_imm('ADC', '69', 3),
+                  rule('ADC', '65', 2),
+              rule_imm('SBC', 'e9', 3),
+                  rule('SBC', 'e5', 2),
+              rule_imm('AND', '29', 3),
+              rule_imm('CMP', 'c9', 3),
+                  rule('CMP', 'c5', 2),
+              rule_imm('REP', 'c2', 2),
 
-                     (r'NOP', inst('ea', 1), 1),
-                     (r'SEC', inst('38', 1), 1),
-                     (r'CLC', inst('18', 1), 1),
-                     (r'ASL', inst('0a', 1), 1),
-                     (r'TCD', inst('5b', 1), 1),
-                     (r'TDC', inst('7b', 1), 1),
-                     (r'TAX', inst('aa', 1), 1),
-                     (r'TAY', inst('a8', 1), 1),
-                     (r'TYA', inst('98', 1), 1),
-                     (r'PHD', inst('0b', 1), 1),
-                     (r'PLD', inst('2b', 1), 1),
-                     (r'RTL', inst('6b', 1), 1),
+             rule_byte('NOP', 'ea'),
+             rule_byte('SEC', '38'),
+             rule_byte('CLC', '18'),
+             rule_byte('ASL', '0a'),
+             rule_byte('TCD', '5b'),
+             rule_byte('TDC', '7b'),
+             rule_byte('TAX', 'aa'),
+             rule_byte('TAY', 'a8'),
+             rule_byte('TYA', '98'),
+             rule_byte('PHD', '0b'),
+             rule_byte('PLD', '2b'),
+             rule_byte('RTL', '6b'),
 )
 
 
